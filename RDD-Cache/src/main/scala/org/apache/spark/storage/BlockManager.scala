@@ -18,7 +18,7 @@
 package org.apache.spark.storage
 
 import java.io._
-import java.lang.ref.{ReferenceQueue => JReferenceQueue, WeakReference}
+import java.lang.ref.{WeakReference, ReferenceQueue => JReferenceQueue}
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.util.Collections
@@ -31,13 +31,10 @@ import scala.concurrent.duration._
 import scala.reflect.ClassTag
 import scala.util.{Failure, Random, Success, Try}
 import scala.util.control.NonFatal
-
 import com.codahale.metrics.{MetricRegistry, MetricSet}
 import com.google.common.cache.CacheBuilder
 import com.intel.oap.common.unsafe.PersistentMemoryPlatform
-
 import org.apache.commons.io.IOUtils
-
 import org.apache.spark._
 import org.apache.spark.executor.DataReadMethod
 import org.apache.spark.internal.Logging
@@ -55,7 +52,7 @@ import org.apache.spark.network.util.TransportConf
 import org.apache.spark.rpc.RpcEnv
 import org.apache.spark.scheduler.ExecutorCacheTaskLocation
 import org.apache.spark.serializer.{SerializerInstance, SerializerManager}
-import org.apache.spark.shuffle.{ShuffleManager, ShuffleWriteMetricsReporter}
+import org.apache.spark.shuffle.{MigratableResolver, ShuffleManager, ShuffleWriteMetricsReporter}
 import org.apache.spark.storage.memory._
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.util._
@@ -273,7 +270,7 @@ private[spark] class BlockManager(
 
   private val slaveEndpoint = rpcEnv.setupEndpoint(
     "BlockManagerEndpoint" + BlockManager.ID_GENERATOR.next,
-    new BlockManagerSlaveEndpoint(rpcEnv, this, mapOutputTracker))
+    new BlockManagerStorageEndpoint(rpcEnv, this, mapOutputTracker))
 
   // Pending re-registration action being executed asynchronously or null if none is pending.
   // Accesses should synchronize on asyncReregisterLock.
@@ -287,6 +284,10 @@ private[spark] class BlockManager(
 
   private var blockReplicationPolicy: BlockReplicationPolicy = _
 
+  // visible for test
+  // This is volatile since if it's defined we should not accept remote blocks.
+  @volatile private[spark] var decommissioner: Option[BlockManagerDecommissioner] = None
+
   // A DownloadFileManager used to track all the files of remote blocks which are above the
   // specified memory threshold. Files will be deleted automatically based on weak reference.
   // Exposed for test
@@ -295,6 +296,26 @@ private[spark] class BlockManager(
   private val maxRemoteBlockToMem = conf.get(config.MAX_REMOTE_BLOCK_SIZE_FETCH_TO_MEM)
 
   var hostLocalDirManager: Option[HostLocalDirManager] = None
+
+  @inline final private def isDecommissioning() = {
+    decommissioner.isDefined
+  }
+
+  @inline final private def checkShouldStore(blockId: BlockId) = {
+    // Don't reject broadcast blocks since they may be stored during task exec and
+    // don't need to be migrated.
+    if (isDecommissioning() && !blockId.isBroadcast) {
+      throw new BlockSavedOnDecommissionedBlockManagerException(blockId)
+    }
+  }
+
+  // This is a lazy val so someone can migrating RDDs even if they don't have a MigratableResolver
+  // for shuffles. Used in BlockManagerDecommissioner & block puts.
+  private[storage] lazy val migratableResolver: MigratableResolver = {
+    shuffleManager.shuffleBlockResolver.asInstanceOf[MigratableResolver]
+  }
+
+  override def getLocalDiskDirs: Array[String] = diskBlockManager.localDirsString
 
   /**
    * Abstraction for storing blocks from bytes, whether they start in memory or on disk.
@@ -1286,22 +1307,6 @@ private[spark] class BlockManager(
       writeMetrics: ShuffleWriteMetricsReporter): DiskBlockObjectWriter = {
     val syncWrites = conf.get(config.SHUFFLE_SYNC)
     new DiskBlockObjectWriter(file, serializerManager, serializerInstance, bufferSize,
-      syncWrites, writeMetrics, blockId)
-  }
-
-  /**
-    * A short circuited method to get a PMem writer that can write data directly to PMem.
-    * The Block will be appended to the PMem stream specified by filename. Callers should handle
-    * error cases.
-    */
-  def getPMemWriter(
-                     blockId: BlockId,
-                     file: File,
-                     serializerInstance: SerializerInstance,
-                     bufferSize: Int,
-                     writeMetrics: ShuffleWriteMetricsReporter): PMemBlockObjectWriter = {
-    val syncWrites = conf.getBoolean("spark.shuffle.sync", false)
-    new PMemBlockObjectWriter(file, serializerManager, serializerInstance, bufferSize,
       syncWrites, writeMetrics, blockId)
   }
 
